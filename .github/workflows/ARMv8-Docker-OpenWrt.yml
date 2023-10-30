@@ -150,7 +150,7 @@ jobs:
 
     env:
       DOCKER_BUILD: buildImageX.sh
-      DOCKER_IMAGE: summary/openwrt-aarch64
+      DOCKER_IMAGE: lj8812/openwrt-aarch64
 
     steps:
     - name: Checkout
