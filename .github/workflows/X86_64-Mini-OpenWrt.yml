@@ -67,7 +67,7 @@ jobs:
         echo "TARGET_SUBTARGET=$(awk -F '[="]+' '/CONFIG_TARGET_SUBTARGET/{print $2}' .config)" >> $GITHUB_ENV
 
     - name: Cache Optimization
-      uses: actions/cache@v3
+      uses: actions/cache@main
       with:
         path: |
           ${{ env.OPENWRT_PATH }}/dl
@@ -116,7 +116,7 @@ jobs:
 
     - name: Upload Artifact
       if: env.UPLOAD_BIN_DIR == 'true'
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@main
       with:
         name: openwrt-bin-${{ env.BUILD_DATE }}
         path: ${{ env.OPENWRT_PATH }}/bin
