@@ -18,119 +18,144 @@ env:
   TZ: Asia/Shanghai
 
 jobs:
-  Build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 120  # 增加超时限制
+  build:
+    runs-on: ubuntu-20.04
 
     steps:
     - name: Checkout
-      uses: actions/checkout@main
-      with:
-        submodules: recursive  # 确保克隆子模块
+      uses: actions/checkout@v4
 
-    - name: Check Server Performance
-      run: |
-        echo "⚠️ 性能警告：服务器资源有限，插件过多可能导致编译失败"
-        echo -e "\n----- CPU Info -----"
-        lscpu | grep -E "Model name|Core(s) per socket"
-        echo -e "\n----- Memory Info -----"
-        free -h
-        echo -e "\n----- Disk Space -----"
-        df -hT $GITHUB_WORKSPACE
-
-    - name: Initialization Environment
+    - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby*
-        sudo apt-get autoremove --purge -y
-        sudo apt-get clean
-        sudo apt-get update
-        sudo apt-get install -y $(curl -fsSL https://is.gd/depends_ubuntu_2204) ccache
+        sudo rm -rf /etc/apt/sources.list.d/* 
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install $(curl -fsSL https://raw.githubusercontent.com/bigbugcc/openwrts/master/openwrt-env)
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /mnt/workdir
+        sudo chown $USER:$GROUPS /mnt/workdir
 
-    - name: Clone Source Code
+    - name: Clone source code
+      working-directory: /mnt/workdir
       run: |
+        df -hT $PWD
         git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /mnt/workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Cache
+      uses: stupidloud/cachewrtbuild@main
+      with:
+          ccache: 'true'
+          mixkey: 'x86'
+          prefix: 'openwrt'
+
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $SYS_CONF_SH
         cd openwrt
-        echo "OPENWRT_PATH=$PWD" >> $GITHUB_ENV
-        # 获取源码元数据
-        echo "COMMIT_INFO=$(git log -1 --format='%h by %an on %cd: %s')" >> $GITHUB_ENV
+        $GITHUB_WORKSPACE/$SYS_CONF_SH
 
-    - name: Generate Build Config
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
       run: |
-        cp $CONFIG_FILE $OPENWRT_PATH/.config
-        cd $OPENWRT_PATH
-        make defconfig
-        # 提取目标信息
-        echo "TARGET_PROFILE=$(awk -F '[="]+' '/CONFIG_TARGET_BOARD/{print $2}' .config)" >> $GITHUB_ENV
-        echo "TARGET_SUBTARGET=$(awk -F '[="]+' '/CONFIG_TARGET_SUBTARGET/{print $2}' .config)" >> $GITHUB_ENV
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $PACKS
+        cd openwrt
+        $GITHUB_WORKSPACE/$PACKS
 
-    - name: Cache Optimization
-      uses: actions/cache@main
-      with:
-        path: |
-          ${{ env.OPENWRT_PATH }}/dl
-          ${{ env.OPENWRT_PATH }}/build_dir/host
-          /usr/local/ccache
-        key: ${{ runner.os }}-build-${{ env.TARGET_PROFILE }}-${{ hashFiles('configs/*.config') }}
-
-    - name: Install Feeds
+    - name: Extend Driver
+      if: env.EXTEND_DRIVER == 'true'
       run: |
-        cd $OPENWRT_PATH
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
+        cat configs/Driver.config >> openwrt/.config
 
-    - name: Apply Customizations
+    - name: Modify configuration
       run: |
-        [ -d files ] && cp -r files $OPENWRT_PATH/
-        chmod +x $GITHUB_WORKSPACE/scripts/*.sh
-        cd $OPENWRT_PATH
-        # 执行自定义脚本
-        bash $GITHUB_WORKSPACE/$DIY_SCRIPT
-        bash $GITHUB_WORKSPACE/scripts/preset-clash-core.sh $CLASH_KERNEL
-        bash $GITHUB_WORKSPACE/scripts/preset-terminal-tools.sh
+        cat $EXTERNAL_FILE >> openwrt/.config
+        cd openwrt && make defconfig
+        # 强制启用 squashfs 和 combined 镜像
+        sed -i '/CONFIG_TARGET_ROOTFS_SQUASHFS/d' .config
+        sed -i '/CONFIG_TARGET_IMAGES_COMBINED/d' .config
+        echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y" >> .config
+        echo "CONFIG_TARGET_IMAGES_COMBINED=y" >> .config
+        cat .config
 
-    - name: Download Packages
+    - name: Download package
+      id: package
       run: |
-        cd $OPENWRT_PATH
-        make -j8 download
-        find dl -size -4k -delete  # 清理无效小文件
+        cd openwrt
+        make download -j$(nproc)
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
 
-    - name: Compile Firmware
-      timeout-minutes: 90  # 单独设置编译超时
+    - name: Compile the firmware
+      id: compile
       run: |
-        cd $OPENWRT_PATH
-        echo "CONFIG_CCACHE=y" >> .config
-        make -j$(($(nproc)+1)) || make -j1 V=s  # 智能并行编译
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) V=s || make -j4 V=s
         echo "status=success" >> $GITHUB_OUTPUT
-        echo "BUILD_DATE=$(date +'%Y.%m.%d')" >> $GITHUB_ENV
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
-    - name: Post-build Processing
-      if: success()
-      run: |
-        cd $OPENWRT_PATH/bin/targets/*/*
-        rm -rf packages *.manifest
-        rename "s/^openwrt/mini-openwrt-$BUILD_DATE/" *
-        echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
 
-    - name: Upload Artifact
-      if: env.UPLOAD_BIN_DIR == 'true'
+    - name: Upload bin directory
       uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
       with:
-        name: openwrt-bin-${{ env.BUILD_DATE }}
-        path: ${{ env.OPENWRT_PATH }}/bin
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
 
-    - name: Create Release
-      if: env.FIRMWARE_RELEASE == 'true'
-      uses: softprops/action-gh-release@v1
+    - name: Organize files
+      id: organize
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
-        tag_name: ${{ env.BUILD_DATE }}
-        name: "Build ${{ env.BUILD_DATE }}"
-        body: |
-          ### 🚀 OpenWrt Build Details
-          - **Platform**: ${{ env.TARGET_PROFILE }}
-          - **Source**: [$REPO_BRANCH]($REPO_URL)
-          - **Build Date**: ${{ env.BUILD_DATE }}
-          - **Commit**: ${{ env.COMMIT_INFO }}
-        files: ${{ env.FIRMWARE_PATH }}/*
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "== Time：$(date +'%Y-%m-%d %H:%M:%S') =="
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M%S")" >> $GITHUB_OUTPUT
+        touch release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Generate release body
+      if: steps.compile.outputs.status == 'success' && !cancelled()
+      run: |
+        echo "![](https://img.shields.io/github/downloads/${{ github.repository }}/${{ steps.tag.outputs.release_tag }}/total?style=flat-square)" >> release.txt
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v1
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        name: ${{ env.OPNAME }}
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
